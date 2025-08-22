@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>TON Rush — MVP (½‑полосы, генератор, коллизии)</title>
+  <style>
+    :root{ --bg: #ff6633; }
+    html,body{height:100%;margin:0;background: var(--bg);}    
+    #game { width:100vw; height:100dvh; }
+    canvas{ image-rendering: pixelated; image-rendering: crisp-edges; }
+    .hud{position:fixed;left:0;right:0;top:0;display:flex;justify-content:space-between;padding:6px 8px;font:12px/1 monospace;color:#000}
+    .btnCol{position:fixed;right:8px;bottom:12px;display:flex;flex-direction:column;gap:8px}
+    .btnCol .btn{background:#000;color:#fff;border:none;border-radius:6px;padding:8px 10px;font:12px/1 monospace;opacity:.85}
+    .btnCol .btn:disabled{opacity:.3}
+    .btnShield{position:fixed;left:8px;bottom:12px;background:#000;color:#fff;border:none;border-radius:6px;padding:8px 10px;font:12px/1 monospace}
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/phaser@3.80.0/dist/phaser.min.js"></script>
+</head>
+<body>
+  <div class="hud">
+    <div>SPD:<span id="spd">0</span></div>
+    <div>BOOST:<span id="boost">0%</span></div>
+    <div>ITEMS: 🚀<span id="r">1</span> 🧨<span id="m">2</span> 🛡️<span id="s">1</span></div>
+  </div>
+  <div class="btnCol">
+    <button class="btn" id="btnRocket">🚀 Rocket</button>
+    <button class="btn" id="btnMine">🧨 Mine</button>
+  </div>
+  <button class="btnShield" id="btnShield">🛡️ Shield</button>
+  <div id="game"></div>
+<script>
+// === Геометрия 3 полос × 2 половины ===
+const WIDTH = 360, HEIGHT = 640;
+const LANES = 3;                 // 0..2
+const TRACK_LEFT = 60;           // левый край трека
+const TRACK_RIGHT = WIDTH-60;    // правый край
+const HALF_COUNT = LANES*2;      // 6 траекторий
+const HALF_W = (TRACK_RIGHT - TRACK_LEFT)/HALF_COUNT;
+const TWEEN_MS = 120;            // плавное смещение на 1/2 полосы
+
+function slotToX(slot){ return TRACK_LEFT + HALF_W*(slot+0.5); }
+function lhToSlot(lane,half){ return lane*2+half; }
+function slotToLH(slot){ return { lane: Math.floor(slot/2), half: (slot%2) }; }
+
+// === Гейм-константы ===
+const V_CRUISE = 100;         // ед/с
+const ACCEL_A = 180;          // разгон ед/с^2
+const BRAKE_DECEL = 220;      // торможение ед/с^2
+const SLOW_FACTOR_OBS = 0.7;  // -30% скорости при столкновении
+
+// Объекты
+const OB_TYPES = ['cube','doubleCube','pyramid','hedgehog'];
+
+class Boot extends Phaser.Scene{ constructor(){ super('Boot'); }
+  preload(){}
+  create(){ this.createOneBitTextures(); this.scene.start('Race'); }
+  createOneBitTextures(){
+    // Байк игрока (вид сверху условный силуэт)
+    const mk = (key,draw)=>{ const g=this.make.graphics({x:0,y:0,add:false}); g.fillStyle(0x000000,1); draw(g); const rt=this.add.renderTexture(0,0,14,18); rt.draw(g,0,0); rt.saveTexture(key); rt.destroy(); g.destroy(); };
+    mk('bike', g=>{ g.fillRect(6,0,2,4); g.fillRect(4,4,6,8); g.fillRect(5,12,4,4); });
+
+    // Препятствия 1-бит
+    const makeTex=(key,draw,w=16,h=12)=>{ const g=this.make.graphics({x:0,y:0,add:false}); g.fillStyle(0x000000,1); draw(g); const rt=this.add.renderTexture(0,0,w,h); rt.draw(g,0,0); rt.saveTexture(key); rt.destroy(); g.destroy(); };
+    makeTex('obs_cube',      g=>{ g.fillRect(0,0,16,12); });
+    makeTex('obs_cube_tall', g=>{ g.fillRect(0,0,16,16); },16,16);
+    makeTex('obs_pyramid',   g=>{ for(let y=0;y<12;y++){ g.fillRect(8-y/1.2, y, (y/0.6),1);} });
+    makeTex('obs_hedgehog',  g=>{ g.fillRect(7,0,2,12); g.fillRect(0,5,16,2); g.fillRect(2,2,12,8); });
+
+    // Dither фон
+    const d=this.make.graphics({x:0,y:0,add:false}); d.fillStyle(0x000000,1);
+    for(let y=0;y<16;y++){ for(let x=0;x<32;x++){ if((x+y*3)%9===0){ d.fillRect(x,y,1,1);} } }
+    const r=this.add.renderTexture(0,0,32,16); r.draw(d,0,0); r.saveTexture('dither'); r.destroy(); d.destroy();
+  }
+}
+
+class Race extends Phaser.Scene{ constructor(){ super('Race'); }
+  init(){
+    this.speed=0; this.pos=0; this.isBraking=false; this.gameOver=false;
+    this.playerSlot=lhToSlot(1,1); // центр правая половина
+    this.obstacles=[]; this.segTimer=0;
+    this.items={ rocket:1, mine:2, shield:1 };
+    this.effects={ boost:{used:0,gauge:0}, slowUntil:0, shieldUntil:0, accelUntil:0 };
+  }
+  create(){
+    this.cameras.main.setBackgroundColor(0xff6633);
+    this.physics.world.drawDebug=false;
+
+    // фон
+    this.bg=this.add.tileSprite(WIDTH/2, 100, WIDTH, 160, 'dither').setOrigin(.5,0);
+    this.bg.setTileScale(2,2);
+
+    // дорога (визуальные разделители половинок)
+    for(let i=0;i<=HALF_COUNT;i++){
+      const x=TRACK_LEFT+HALF_W*i;
+      const ln=this.add.rectangle(x,0,1,HEIGHT,0x000000,0.08).setOrigin(0.5,0);
+    }
+
+    // игрок
+    this.player=this.add.sprite(slotToX(this.playerSlot), HEIGHT-110, 'bike').setOrigin(0.5,0.5);
+
+    // ввод: тапы слева/справа от байка => сдвиг на 1/2 полосы
+    this.input.on('pointerdown', (p)=>{
+      // Игнорируем клики по кнопкам
+      const el=p.event.target; if(el && (el.id==='btnRocket'||el.id==='btnMine'||el.id==='btnShield')) return;
+      const isLeft = p.x < this.player.x; const delta = isLeft? -1: 1;
+      const next = Phaser.Math.Clamp(this.playerSlot + delta, 0, HALF_COUNT-1);
+      if(next!==this.playerSlot){ this.tweens.add({targets:this.player,x:slotToX(next),duration:TWEEN_MS,ease:'Sine.inOut'}); this.playerSlot=next; }
+    });
+
+    // жест торможения: долгий свайп вниз
+    this.input.on('pointermove', (p)=>{ if(p.isDown && p.velocity.y>0.35 && p.getDuration()>180){ this.isBraking=true; }});
+    this.input.on('pointerup', ()=>{ this.isBraking=false; });
+
+    // кнопки предметов
+    document.getElementById('btnRocket').onclick=()=>this.fireRocket();
+    document.getElementById('btnMine').onclick=()=>this.dropMine();
+    document.getElementById('btnShield').onclick=()=>this.useShield();
+
+    // HUD refs
+    this.$spd=document.getElementById('spd');
+    this.$boost=document.getElementById('boost');
+    this.$r=document.getElementById('r'); this.$m=document.getElementById('m'); this.$s=document.getElementById('s');
+
+    // группы
+    this.obsGroup=this.add.group();
+    this.mines=[]; this.rockets=[];
+  }
+
+  // === Способности (заглушки визуала для MVP) ===
+  fireRocket(){ if(this.items.rocket<=0) return; this.items.rocket--; this.$r.textContent=this.items.rocket; /* TODO: полёт/наводка */ }
+  dropMine(){ if(this.items.mine<=0) return; this.items.mine--; this.$m.textContent=this.items.mine; /* TODO: объект мины с таймером */ }
+  useShield(){ if(this.items.shield<=0) return; this.items.shield--; this.$s.textContent=this.items.shield; this.effects.shieldUntil=this.time.now+10000; }
+
+  // === Генерация сегментов с ½‑препятствиями ===
+  generateSegment(){
+    const count = Phaser.Math.Between(1,3);
+    const lanes = Phaser.Utils.Array.Shuffle([0,1,2]).slice(0,count);
+    const seg=[];
+    for(const ln of lanes){ const half=Phaser.Math.Between(0,1); const type=Phaser.Math.RND.weightedPick(['cube','cube','doubleCube','pyramid','hedgehog']); seg.push({lane:ln,half,type}); }
+    return seg; // как минимум одна половинка на любой полосе остаётся свободной статистически
+  }
+
+  spawnObstacles(y){
+    const seg=this.generateSegment();
+    seg.forEach(s=>{
+      const slot=lhToSlot(s.lane,s.half); const x=slotToX(slot);
+      const key = (s.type==='cube')?'obs_cube':(s.type==='doubleCube')?'obs_cube_tall':(s.type==='pyramid')?'obs_pyramid':'obs_hedgehog';
+      const go=this.add.sprite(x,y,key).setOrigin(0.5,1);
+      this.obsGroup.add(go);
+      this.obstacles.push({type:s.type,lane:s.lane,half:s.half,slot,go,alive:true});
+    });
+  }
+
+  update(time, delta){
+    if(this.gameOver) return; const dt=delta/1000;
+
+    // фоновый dither
+    this.bg.tilePositionX += this.speed * dt * 0.2;
+
+    // ускорение/торможение и капы
+    const now=this.time.now;
+    const accelCap = (now < this.effects.accelUntil) ? 1.25*V_CRUISE : V_CRUISE;
+    const slowCap  = (now < this.effects.slowUntil)  ? 0.5*V_CRUISE  : Infinity;
+    let cap = Math.min(accelCap, slowCap);
+
+    if(this.isBraking){ this.speed = Math.max(0, this.speed - BRAKE_DECEL*dt); }
+    else{
+      if(this.speed < cap) this.speed = Math.min(cap, this.speed + ACCEL_A*dt);
+      else if(this.speed > cap) this.speed = Math.max(cap, this.speed - ACCEL_A*dt*0.6);
+    }
+
+    this.pos += this.speed*dt;
+
+    // HUD
+    this.$spd.textContent = Math.round(this.speed);
+    // бустовая шкала (для примера заполняем пассивно)
+    if(this.effects.boost.gauge < 1) this.effects.boost.gauge = Math.min(1, this.effects.boost.gauge + 0.12*dt);
+    this.$boost.textContent = Math.round(this.effects.boost.gauge*100)+'%';
+
+    // генератор сегментов
+    this.segTimer -= delta;
+    if(this.segTimer<=0){ this.spawnObstacles(-20); this.segTimer = 650; }
+
+    // скролл препятствий вниз и очистка
+    const scroll = (60 + this.speed*0.6)*dt;
+    this.obstacles.forEach(o=>{ if(!o.alive) return; o.go.y += scroll; if(o.go.y > HEIGHT+40){ o.alive=false; o.go.destroy(); } });
+
+    // коллизии: совпал слот + близость по Y
+    const HIT_EPS = 16;
+    this.obstacles.forEach(o=>{
+      if(!o.alive) return; if(o.slot !== this.playerSlot) return;
+      if(Math.abs(o.go.y - this.player.y) < HIT_EPS){
+        // столкновение: -30% текущей скорости
+        this.speed *= SLOW_FACTOR_OBS;
+        o.alive=false; o.go.destroy();
+        // лёгкий шок — блокируем тормоз на 150мс (по желанию)
+      }
+    });
+  }
+}
+
+const config={ type:Phaser.AUTO, parent:'game', width:WIDTH, height:HEIGHT, pixelArt:true, roundPixels:true, scene:[Boot,Race] };
+new Phaser.Game(config);
+</script>
+</body>
+</html>
