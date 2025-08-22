@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <title>TON Rush — Debug MVP</title>
+  <style>
+    html,body { height:100%; margin:0; background:#0b1025; }
+    #game { width:100vw; height:100dvh; }
+    canvas { image-rendering: pixelated; image-rendering: crisp-edges; }
+    .hud{position:fixed;left:0;right:0;top:0;display:flex;justify-content:space-between;padding:6px 8px;font:12px/1 monospace;color:#b7c6ff;pointer-events:none}
+    .btnCol{position:fixed;right:8px;bottom:12px;display:flex;flex-direction:column;gap:8px}
+    .btnCol .btn{background:#0a0e20;color:#e6ecff;border:1px solid #2a3b7a;border-radius:10px;padding:10px 12px;font:12px/1 monospace;box-shadow:0 0 8px rgba(36,160,255,.3)}
+    .btnCol .btn:disabled{opacity:.35}
+    .btnShield{position:fixed;left:8px;bottom:12px;background:#0a0e20;color:#e6ecff;border:1px solid #2a3b7a;border-radius:10px;padding:10px 12px;font:12px/1 monospace;box-shadow:0 0 8px rgba(36,160,255,.3)}
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/phaser@3.80.0/dist/phaser.min.js"></script>
+</head>
+<body>
+  <div class="hud">
+    <div>SPD:<span id="spd">0</span></div>
+    <div>BOOST:<span id="boost">0%</span></div>
+    <div>ITEMS: 🚀<span id="r">1</span> 🧨<span id="m">2</span> 🛡️<span id="s">1</span></div>
+  </div>
+  <div class="btnCol">
+    <button class="btn" id="btnRocket">🚀 Rocket</button>
+    <button class="btn" id="btnMine">🧨 Mine</button>
+  </div>
+  <button class="btnShield" id="btnShield">🛡️ Shield</button>
+  <div id="game"></div>
+
+<script>
+const WIDTH=360, HEIGHT=640;
+const COLORS = {
+  bgTop:0x0b1025, bgBot:0x12183a,
+  road:0x12224a, railGlow:0x1dd1ff, railCore:0x2fe1ff, center:0x34a2ff,
+  skylineA:0x120d2b, skylineB:0x1a1340
+};
+const HORIZON_Y=140, ROAD_BOTTOM=560, ROAD_TOP_W=120, ROAD_BOT_W=280, ROAD_CENTER=WIDTH/2;
+function roadHalfWidthAtY(y){ const t=Phaser.Math.Clamp((y-HORIZON_Y)/(ROAD_BOTTOM-HORIZON_Y),0,1); return Phaser.Math.Linear(ROAD_TOP_W/2,ROAD_BOT_W/2,t);}
+function roadLeftAtY(y){return ROAD_CENTER-roadHalfWidthAtY(y);}
+function roadRightAtY(y){return ROAD_CENTER+roadHalfWidthAtY(y);}
+function slotToXAtY(slot,y){const left=roadLeftAtY(y);const right=roadRightAtY(y);const step=(right-left)/6;return left+step*(slot+0.5);}
+
+class Boot extends Phaser.Scene{
+  constructor(){super('Boot');}
+  create(){
+    this.add.text(6,6,'BOOT OK',{fontFamily:'monospace',fontSize:'10px',color:'#8ff'}).setDepth(9999);
+    console.log('[TON RUSH] Boot started');
+    this.scene.start('Race');
+  }
+}
+
+class Race extends Phaser.Scene{
+  constructor(){super('Race');}
+  init(){this.speed=0;this.playerSlot=3;this.playerY=ROAD_BOTTOM-80;}
+  create(){
+    this.add.text(6,18,'RACE OK',{fontFamily:'monospace',fontSize:'10px',color:'#8ff'}).setDepth(9999);
+    console.log('[TON RUSH] Race started');
+
+    // город
+    this.cityFar=this.add.tileSprite(WIDTH/2,HORIZON_Y+8,WIDTH,90,null).setOrigin(0.5,1).setAlpha(.75).setDepth(-950);
+    this.cityNear=this.add.tileSprite(WIDTH/2,HORIZON_Y+24,WIDTH,120,null).setOrigin(0.5,1).setAlpha(1.0).setDepth(-940);
+
+    // графика дороги
+    this.roadG=this.add.graphics().setDepth(-900);
+    this.railsG=this.add.graphics().setDepth(-880);
+    this.centerG=this.add.graphics().setDepth(-879);
+    this.drawRoad();
+
+    // байк
+    this.player=this.add.sprite(slotToXAtY(this.playerSlot,this.playerY),this.playerY,null)
+      .setOrigin(0.5,0.5).setScale(1.2).setDepth(20);
+
+    if(!this.player.texture||this.player.texture.key==='__MISSING'){
+      this.playerCircle=this.add.circle(slotToXAtY(this.playerSlot,this.playerY),this.playerY,6,0x9a4dff,1).setDepth(20);
+      console.log('[TON RUSH] Using fallback circle as player');
+    }
+
+    this.input.on('pointerdown',(p)=>{
+      const isLeft=p.x<this.player.x;const delta=isLeft?-1:1;
+      const next=Phaser.Math.Clamp(this.playerSlot+delta,0,5);
+      if(next!==this.playerSlot){
+        const targetX=slotToXAtY(next,this.playerY);
+        this.tweens.add({targets:this.player,x:targetX,duration:120,ease:'Sine.inOut'});
+        if(this.playerCircle) this.tweens.add({targets:this.playerCircle,x:targetX,duration:120,ease:'Sine.inOut'});
+        this.playerSlot=next;
+      }
+    });
+  }
+
+  drawRoad(){
+    this.roadG.clear(); this.railsG.clear(); this.centerG.clear();
+    const g=this.roadG;
+    g.fillStyle(COLORS.road,1);
+    g.beginPath();
+    g.moveTo(roadLeftAtY(HORIZON_Y),HORIZON_Y);
+    g.lineTo(roadRightAtY(HORIZON_Y),HORIZON_Y);
+    g.lineTo(roadRightAtY(ROAD_BOTTOM),ROAD_BOTTOM);
+    g.lineTo(roadLeftAtY(ROAD_BOTTOM),ROAD_BOTTOM);
+    g.closePath(); g.fillPath();
+    const r=this.railsG;
+    const draw=(w,c,a,x0,y0,x1,y1)=>{r.lineStyle(w,c,a);r.beginPath();r.moveTo(x0,y0);r.lineTo(x1,y1);r.strokePath();};
+    const lTop=roadLeftAtY(HORIZON_Y), lBot=roadLeftAtY(ROAD_BOTTOM);
+    const rTop=roadRightAtY(HORIZON_Y), rBot=roadRightAtY(ROAD_BOTTOM);
+    draw(6,COLORS.railGlow,.28,lTop,HORIZON_Y,lBot,ROAD_BOTTOM);
+    draw(6,COLORS.railGlow,.28,rTop,HORIZON_Y,rBot,ROAD_BOTTOM);
+    draw(3,COLORS.railGlow,.65,lTop,HORIZON_Y,lBot,ROAD_BOTTOM);
+    draw(3,COLORS.railGlow,.65,rTop,HORIZON_Y,rBot,ROAD_BOTTOM);
+    draw(1,COLORS.railCore,1.00,lTop,HORIZON_Y,lBot,ROAD_BOTTOM);
+    draw(1,COLORS.railCore,1.00,rTop,HORIZON_Y,rBot,ROAD_BOTTOM);
+  }
+
+  update(time,delta){
+    if(!this._loggedOnce){console.log('[TON RUSH] update() ticking');this._loggedOnce=true;}
+    const dt=delta/1000;
+    this.cityFar.tilePositionX+=12*dt;
+    this.cityNear.tilePositionX+=18*dt;
+    // центр-пунктир
+    this.centerG.clear(); this.centerG.lineStyle(2,COLORS.center,1);
+    const dash=18,gap=12;
+    let y=HORIZON_Y+6, phase=(performance.now()/80)%(dash+gap);
+    y+=(dash+gap)-phase;
+    for(;y<ROAD_BOTTOM;y+=dash+gap){
+      this.centerG.beginPath();this.centerG.moveTo(ROAD_CENTER,y);
+      this.centerG.lineTo(ROAD_CENTER,Math.min(y+dash,ROAD_BOTTOM));
+      this.centerG.strokePath();
+    }
+  }
+}
+
+const config={type:Phaser.AUTO,parent:'game',width:WIDTH,height:HEIGHT,pixelArt:true,roundPixels:true,backgroundColor:'#0b1025',scale:{mode:Phaser.Scale.FIT,autoCenter:Phaser.Scale.CENTER_BOTH},scene:[Boot,Race]};
+new Phaser.Game(config);
+
+// кнопки-заглушки
+document.getElementById('btnRocket').onclick=()=>console.log('Rocket: TODO');
+document.getElementById('btnMine').onclick=()=>console.log('Mine: TODO');
+document.getElementById('btnShield').onclick=()=>console.log('Shield: TODO');
+</script>
+</body>
+</html>
